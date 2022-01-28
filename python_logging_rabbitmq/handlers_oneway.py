@@ -163,7 +163,7 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     )
                 )
 
-            except Queue.Empty:
+            except queue.Empty:
                 continue
             except Exception:
                 self.channel, self.connection = None, None
