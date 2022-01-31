@@ -7,6 +7,7 @@ from copy import copy
 import pika
 from pika import credentials
 
+from .compat import Empty
 from .compat import Queue
 from .filters import FieldFilter
 from .formatters import JSONFormatter
@@ -163,7 +164,7 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     )
                 )
 
-            except queue.Empty:
+            except Empty:
                 continue
             except Exception:
                 self.channel, self.connection = None, None
@@ -210,6 +211,12 @@ class RabbitMQHandlerOneWay(logging.Handler):
         except Exception:
             self.channel, self.connection = None, None
             self.handleError(record)
+
+    def queue_depth(self):
+        """
+        How many log messages the handler is waiting to send.
+        """
+        return self.queue.qsize()
 
     def close(self):
         """
