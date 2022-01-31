@@ -7,6 +7,7 @@ from copy import copy
 import pika
 from pika import credentials
 
+from .compat import Empty
 from .compat import Queue
 from .filters import FieldFilter
 from .formatters import JSONFormatter
@@ -150,20 +151,23 @@ class RabbitMQHandlerOneWay(logging.Handler):
             try:
                 record, routing_key = self.queue.get(block=True, timeout=10)
 
-                if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
-                    self.open_connection()
+                try:
+                    if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
+                        self.open_connection()
 
-                res = self.channel.basic_publish(
-                    exchange=self.exchange,
-                    routing_key=routing_key,
-                    body=record,
-                    properties=pika.BasicProperties(
-                        delivery_mode=2,
-                        headers=self.message_headers
+                    res = self.channel.basic_publish(
+                        exchange=self.exchange,
+                        routing_key=routing_key,
+                        body=record,
+                        properties=pika.BasicProperties(
+                            delivery_mode=2,
+                            headers=self.message_headers
+                        )
                     )
-                )
+                finally:
+                    self.queue.task_done()
 
-            except queue.Empty:
+            except Empty:
                 continue
             except Exception:
                 self.channel, self.connection = None, None
@@ -172,7 +176,6 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 if self.stopping.is_set():
                     self.stopped.set()
                     break
-                self.queue.task_done()
                 if self.close_after_emit:
                     self.close_connection()
         self.stopped.set()
@@ -210,6 +213,12 @@ class RabbitMQHandlerOneWay(logging.Handler):
         except Exception:
             self.channel, self.connection = None, None
             self.handleError(record)
+
+    def queue_depth(self):
+        """
+        How many log messages the handler is waiting to send.
+        """
+        return self.queue.qsize()
 
     def close(self):
         """
