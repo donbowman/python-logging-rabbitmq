@@ -28,7 +28,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
         routing_key_formatter=None,
         close_after_emit=False,
         fields=None, fields_under_root=True, message_headers=None,
-        record_fields=None, exclude_record_fields=None):
+        record_fields=None, exclude_record_fields=None,
+        send_callback=None, send_fail_callback=None):
         # Initialize the handler.
         #
         # :param level:                 Logs level.
@@ -50,6 +51,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
         # :param fields_under_root:     Merge the fields in the root object.
         # :record_fields                A set of attributes that should be preserved from the record object.
         # :exclude_record_fields        A set of attributes that should be ignored from the record object.
+        # :send_callback:               A function taking one int (num_send) called on send. Optional.
+        # :send_failure_callback:       A function taking one int (num_send) called on failure to send. Optional.
 
         super(RabbitMQHandlerOneWay, self).__init__(level=level)
 
@@ -85,6 +88,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
         )
         self.fields = fields if isinstance(fields, dict) else {}
         self.fields_under_root = fields_under_root
+        self.send_callback = send_callback
+        self.send_fail_callback = send_fail_callback
 
         if len(self.fields) > 0:
             self.addFilter(FieldFilter(self.fields, self.fields_under_root))
@@ -148,6 +153,7 @@ class RabbitMQHandlerOneWay(logging.Handler):
 
     def message_worker(self):
         while not self.stopping.is_set():
+            record = None
             try:
                 record, routing_key = self.queue.get(block=True, timeout=10)
 
@@ -164,6 +170,12 @@ class RabbitMQHandlerOneWay(logging.Handler):
                             headers=self.message_headers
                         )
                     )
+                    if self.send_callback:
+                        self.send_callback(1)
+                except:
+                    if self.send_fail_callback:
+                        self.send_fail_callback(1)
+                    raise
                 finally:
                     self.queue.task_done()
 
@@ -171,7 +183,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 continue
             except Exception:
                 self.channel, self.connection = None, None
-                self.handleError(record)
+                if record is not None:
+                    self.handleError(record)
             finally:
                 if self.stopping.is_set():
                     self.stopped.set()

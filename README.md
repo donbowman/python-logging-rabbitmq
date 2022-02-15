@@ -143,6 +143,8 @@ These are the configuration allowed:
 | message_headers       | A dictionary of headers to be published with the message.                                                                                | None                                  |
 | record_fields         | A set of attributes that should be preserved from the record object.                                                                     | None                                  |
 | exclude_record_fields | A set of attributes that should be ignored from the record object.                                                                       | None                                  |
+| send_callback         | A function taking a single int invoked with the number of succesfully sent messages. Useful for instrumentation.                         | None                                  |
+| send_fail_callback    | A function taking a single int invoked with the number of failed messages. Useful for instrumentation.                                   | None                                  |
 
 
 ### Examples
