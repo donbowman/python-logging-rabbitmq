@@ -23,7 +23,8 @@ class RabbitMQHandler(logging.Handler):
         routing_key_formatter=None,
         close_after_emit=False,
         fields=None, fields_under_root=True, message_headers=None,
-        record_fields=None, exclude_record_fields=None):
+        record_fields=None, exclude_record_fields=None,
+        send_callback=None, send_fail_callback=None):
         # Initialize the handler.
         #
         # :param level:                 Logs level.
@@ -45,6 +46,8 @@ class RabbitMQHandler(logging.Handler):
         # :param fields_under_root:     Merge the fields in the root object.
         # :record_fields                A set of attributes that should be preserved from the record object.
         # :exclude_record_fields        A set of attributes that should be ignored from the record object.
+        # :send_callback:               A function taking one int (num_send) called on send. Optional.
+        # :send_failure_callback:       A function taking one int (num_send) called on failure to send. Optional.
 
         super(RabbitMQHandler, self).__init__(level=level)
 
@@ -83,6 +86,9 @@ class RabbitMQHandler(logging.Handler):
 
         if len(self.fields) > 0:
             self.addFilter(FieldFilter(self.fields, self.fields_under_root))
+
+        self.send_callback = send_callback
+        self.send_fail_callback = send_fail_callback
 
         # Connect.
         self.createLock()
@@ -170,8 +176,13 @@ class RabbitMQHandler(logging.Handler):
                 )
             )
 
+            if self.send_callback:
+                self.send_callback(1)
+
         except Exception:
             self.channel, self.connection = None, None
+            if self.send_fail_callback:
+                self.send_fail_callback(1)
             self.handleError(record)
         finally:
             if self.close_after_emit:
