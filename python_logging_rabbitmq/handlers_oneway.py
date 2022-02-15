@@ -218,6 +218,9 @@ class RabbitMQHandlerOneWay(logging.Handler):
         """
         How many log messages the handler is waiting to send.
         """
+        if self.queue is None:
+            return 0
+
         return self.queue.qsize()
 
     def close(self):
