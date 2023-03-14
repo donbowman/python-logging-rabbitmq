@@ -29,7 +29,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
         close_after_emit=False,
         fields=None, fields_under_root=True, message_headers=None,
         record_fields=None, exclude_record_fields=None,
-        send_callback=None, send_fail_callback=None):
+        send_callback=None, send_fail_callback=None,
+        dropped_record_callback=None,
+        max_send_retries=5,
+        get_timeout_seconds=10):
         # Initialize the handler.
         #
         # :param level:                 Logs level.
@@ -64,6 +67,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
         self.remove_request = remove_request
         self.routing_key_format = routing_key_format
         self.close_after_emit = close_after_emit
+        self.max_send_retries = max_send_retries
+        self.get_timeout_seconds = get_timeout_seconds
 
         # Connection parameters.
         # Allow extra params when connect to RabbitMQ.
@@ -90,6 +95,7 @@ class RabbitMQHandlerOneWay(logging.Handler):
         self.fields_under_root = fields_under_root
         self.send_callback = send_callback
         self.send_fail_callback = send_fail_callback
+        self.dropped_record_callback = dropped_record_callback
 
         if len(self.fields) > 0:
             self.addFilter(FieldFilter(self.fields, self.fields_under_root))
@@ -151,11 +157,38 @@ class RabbitMQHandlerOneWay(logging.Handler):
         worker.setDaemon(True)
         worker.start()
 
+    def record_dropped(self):
+        if self.dropped_record_callback:
+            self.dropped_record_callback(1)
+
+    def record_sent(self):
+        if self.send_callback:
+            self.send_callback(1)
+
+    def record_send_failed(self):
+        if self.send_fail_callback:
+            self.send_fail_callback(1)
+
     def message_worker(self):
+        record = None
+        retry_record = False
+        num_retries = 0
         while not self.stopping.is_set():
-            record = None
             try:
-                record, routing_key = self.queue.get(block=True, timeout=10)
+                if retry_record and num_retries > self.max_send_retries:
+                    # failed to send after max retries
+                    retry_record = False
+                    num_retries = 0
+                    self.record_dropped()
+                    try:
+                        if record:
+                            self.handleError(record)
+                        record = None
+                    except:
+                        pass
+
+                if not retry_record:
+                    record, routing_key = self.queue.get(block=True, timeout=self.get_timeout_seconds)
 
                 try:
                     if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
@@ -170,11 +203,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
                             headers=self.message_headers
                         )
                     )
-                    if self.send_callback:
-                        self.send_callback(1)
+                    retry_record = False
+                    self.record_sent()
                 except:
-                    if self.send_fail_callback:
-                        self.send_fail_callback(1)
+                    self.record_send_failed()
                     raise
                 finally:
                     self.queue.task_done()
@@ -184,7 +216,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
             except Exception:
                 self.channel, self.connection = None, None
                 if record is not None:
-                    self.handleError(record)
+                    if not retry_record:
+                        num_retries = 0
+                    retry_record = True
+                    num_retries += 1
             finally:
                 if self.stopping.is_set():
                     self.stopped.set()
@@ -231,10 +266,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
         """
         How many log messages the handler is waiting to send.
         """
-        if self.queue is None:
-            return 0
+        if hasattr(self, 'queue'):
+            return self.queue.qsize()
 
-        return self.queue.qsize()
+        return 0
 
     def close(self):
         """
@@ -242,7 +277,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
         """
         self.acquire()
 
-        del self.queue
+        if hasattr(self, 'queue'):
+            del self.queue
 
         try:
             self.close_connection()
