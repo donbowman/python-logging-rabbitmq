@@ -187,7 +187,9 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     except:
                         pass
 
+                set_task_done=False
                 if not retry_record:
+                    set_task_done = True
                     record, routing_key = self.queue.get(block=True, timeout=self.get_timeout_seconds)
 
                 try:
@@ -209,7 +211,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     self.record_send_failed()
                     raise
                 finally:
-                    self.queue.task_done()
+                    # only if a record was retrieved from queue, set it to done.
+                    if set_task_done:
+                        set_task_done = False
+                        self.queue.task_done()
 
             except Empty:
                 continue
