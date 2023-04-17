@@ -7,8 +7,18 @@ from copy import copy
 import pika
 from pika import credentials
 
-from .compat import Empty
-from .compat import Queue
+try:
+    from gevent import monkey
+    if monkey.is_module_patched("_thread"):
+        from gevent.queue import Queue
+        from gevent.queue import Empty
+    else:
+        from .compat import Empty
+        from .compat import Queue
+except:
+    from .compat import Empty
+    from .compat import Queue
+
 from .filters import FieldFilter
 from .formatters import JSONFormatter
 from .compat import ExceptionReporter
