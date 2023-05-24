@@ -10,7 +10,7 @@ from pika import credentials
 try:
     from gevent import monkey
     if monkey.is_module_patched("_thread"):
-        from gevent.queue import Queue
+        from gevent.queue import JoinableQueue as Queue
         from gevent.queue import Empty
     else:
         from .compat import Empty
