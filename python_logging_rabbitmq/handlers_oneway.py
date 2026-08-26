@@ -29,6 +29,12 @@ from .compat import ExceptionReporter
 
 logger = logging.getLogger(__name__)
 
+# Upper bound (seconds) on how long closing a channel/connection may block.
+# The AMQP close handshake is run in a background thread and joined with this
+# timeout so an unresponsive broker (or a stub/test broker) can never hang
+# shutdown indefinitely.
+CLOSE_HANDSHAKE_TIMEOUT = 5.0
+
 
 class RabbitMQHandlerOneWay(logging.Handler):
     """
@@ -175,6 +181,12 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 # finally so a failed connection attempt can't leak handlers.
                 rabbitmq_logger.removeHandler(handler)
 
+    def _close_target(self, target):
+        try:
+            target.close()
+        except Exception:
+            pass
+
     def close_connection(self):
         """
         Close active connection.
@@ -182,19 +194,21 @@ class RabbitMQHandlerOneWay(logging.Handler):
         self.stopping.set()
         while not self.stopped.is_set():
             time.sleep(1)
-        if self.channel:
-            try:
-                self.channel.close()
-            except Exception:
-                pass
-            self.channel = None
 
-        if self.connection:
-            try:
-                self.connection.close()
-            except Exception:
-                pass
-            self.connection = None
+        # Run the AMQP close handshake in a background thread so a broker that
+        # never responds (e.g. a network partition or a stub/test broker whose
+        # event loop isn't being pumped) cannot block shutdown forever. We wait
+        # up to CLOSE_HANDSHAKE_TIMEOUT for it to complete.
+        for attr in ("channel", "connection"):
+            target = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if target is not None:
+                closer = threading.Thread(
+                    target=self._close_target, args=(target,)
+                )
+                closer.daemon = True
+                closer.start()
+                closer.join(CLOSE_HANDSHAKE_TIMEOUT)
 
     def start_message_worker(self):
         self.stopping = threading.Event()
