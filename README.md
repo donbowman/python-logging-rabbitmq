@@ -145,6 +145,12 @@ These are the configuration allowed:
 | exclude_record_fields | A set of attributes that should be ignored from the record object.                                                                       | None                                  |
 | send_callback         | A function taking a single int invoked with the number of succesfully sent messages. Useful for instrumentation.                         | None                                  |
 | send_fail_callback    | A function taking a single int invoked with the number of failed messages. Useful for instrumentation.                                   | None                                  |
+| dropped_record_callback | A function taking a single int invoked when a record is dropped (e.g. failed after max retries or queue full). Useful for instrumentation. | None                                |
+| max_send_retries      | How many times to retry a record that failed to send before dropping it.                                                                 | 5                                     |
+| get_timeout_seconds   | How long (seconds) the message worker blocks waiting for a new record.                                                                   | 10                                    |
+| retry_delay           | Base delay (seconds) between send retries. Doubles on each consecutive failure (with jitter), capped at `max_retry_delay`.               | 1.0                                   |
+| max_retry_delay       | Maximum delay (seconds) between send retries.                                                                                            | 30.0                                  |
+| max_queue_size        | Maximum number of records to buffer in memory while the broker is unreachable. 0 (default) means unbounded; when full, new records are dropped. | 0                               |
 
 
 ### Examples
@@ -159,7 +165,8 @@ rabbit = RabbitMQHandler(
 	connection_params={
 		'virtual_host': '/',
 		'connection_attempts': 3,
-		'socket_timeout': 5000
+		'socket_timeout': 10,
+		'heartbeat': 60
 	}
 )
 ```
@@ -236,7 +243,7 @@ LOGGING = {
 			'connection_params': {
 				'virtual_host': '/',
 				'connection_attempts': 3,
-				'socket_timeout': 5000
+				'socket_timeout': 10
 			},
 			'fields': {
 				'source': 'MainAPI',

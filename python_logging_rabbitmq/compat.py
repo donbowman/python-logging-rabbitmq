@@ -6,10 +6,12 @@ if sys.version_info[0] == 2:
     text_type = unicode
     from Queue import Queue as Queue
     from Queue import Empty
+    from Queue import Full
 else:
     text_type = str
     from queue import Queue as Queue
     from queue import Empty
+    from queue import Full
 
 try:
     import ujson as json  # noqa: F401

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import random
 import time
 import logging
 import threading
@@ -12,16 +13,21 @@ try:
     if monkey.is_module_patched("_thread"):
         from gevent.queue import JoinableQueue as Queue
         from gevent.queue import Empty
+        from gevent.queue import Full
     else:
         from .compat import Empty
+        from .compat import Full
         from .compat import Queue
 except:
     from .compat import Empty
+    from .compat import Full
     from .compat import Queue
 
 from .filters import FieldFilter
 from .formatters import JSONFormatter
 from .compat import ExceptionReporter
+
+logger = logging.getLogger(__name__)
 
 
 class RabbitMQHandlerOneWay(logging.Handler):
@@ -42,7 +48,10 @@ class RabbitMQHandlerOneWay(logging.Handler):
         send_callback=None, send_fail_callback=None,
         dropped_record_callback=None,
         max_send_retries=5,
-        get_timeout_seconds=10):
+        get_timeout_seconds=10,
+        retry_delay=1.0,
+        max_retry_delay=30.0,
+        max_queue_size=0):
         # Initialize the handler.
         #
         # :param level:                 Logs level.
@@ -66,6 +75,17 @@ class RabbitMQHandlerOneWay(logging.Handler):
         # :exclude_record_fields        A set of attributes that should be ignored from the record object.
         # :send_callback:               A function taking one int (num_send) called on send. Optional.
         # :send_failure_callback:       A function taking one int (num_send) called on failure to send. Optional.
+        # :max_send_retries:            How many times to retry a record that failed to send before
+        #                               dropping it. Default 5.
+        # :get_timeout_seconds:         How long (seconds) the message worker blocks waiting for a new
+        #                               record. Default 10.
+        # :retry_delay:                 Base delay (seconds) between send retries. The delay doubles on
+        #                               each consecutive failure (with jitter), capped at max_retry_delay.
+        #                               Default 1.0.
+        # :max_retry_delay:             Maximum delay (seconds) between send retries. Default 30.0.
+        # :max_queue_size:              Maximum number of records to buffer in memory while the broker is
+        #                               unreachable. 0 (default) means unbounded. When the queue is full,
+        #                               new records are dropped and dropped_record_callback is invoked.
 
         super(RabbitMQHandlerOneWay, self).__init__(level=level)
 
@@ -79,13 +99,19 @@ class RabbitMQHandlerOneWay(logging.Handler):
         self.close_after_emit = close_after_emit
         self.max_send_retries = max_send_retries
         self.get_timeout_seconds = get_timeout_seconds
+        self.retry_delay = retry_delay
+        self.max_retry_delay = max_retry_delay
+        self.max_queue_size = max_queue_size
 
         # Connection parameters.
         # Allow extra params when connect to RabbitMQ.
         # @see: http://pika.readthedocs.io/en/0.10.0/modules/parameters.html#pika.connection.ConnectionParameters
         conn_params = connection_params if isinstance(connection_params, dict) else {}
         self.connection_params = conn_params.copy()
-        self.connection_params.update(dict(host=host, port=port, heartbeat=0))
+        self.connection_params.update(dict(host=host, port=port))
+        # Enable AMQP heartbeats so a dead/half-open broker connection is
+        # detected instead of blocking forever. Callers may override.
+        self.connection_params.setdefault('heartbeat', 60)
 
         if username and password:
             self.connection_params['credentials'] = credentials.PlainCredentials(username, password)
@@ -114,7 +140,9 @@ class RabbitMQHandlerOneWay(logging.Handler):
         self.createLock()
 
         # message queue
-        self.queue = Queue()
+        # maxsize=0 means unbounded; a positive max_queue_size bounds the
+        # in-memory buffer so a broker outage can't OOM the process.
+        self.queue = Queue(maxsize=self.max_queue_size)
         self.start_message_worker()
 
     def open_connection(self):
@@ -131,19 +159,21 @@ class RabbitMQHandlerOneWay(logging.Handler):
             rabbitmq_logger.propagate = False
             rabbitmq_logger.setLevel(logging.WARNING)
 
-            # Connect.
-            if not self.connection or self.connection.is_closed:
-                self.connection = pika.BlockingConnection(pika.ConnectionParameters(**self.connection_params))
+            try:
+                # Connect.
+                if not self.connection or self.connection.is_closed:
+                    self.connection = pika.BlockingConnection(pika.ConnectionParameters(**self.connection_params))
 
-            if not self.channel or self.channel.is_closed:
-                self.channel = self.connection.channel()
+                if not self.channel or self.channel.is_closed:
+                    self.channel = self.connection.channel()
 
-            if self.exchange_declared is False:
-                self.channel.exchange_declare(exchange=self.exchange, exchange_type='topic', durable=True, auto_delete=False)
-                self.exchange_declared = True
-
-            # Manually remove logger to avoid shutdown message.
-            rabbitmq_logger.removeHandler(handler)
+                if self.exchange_declared is False:
+                    self.channel.exchange_declare(exchange=self.exchange, exchange_type='topic', durable=True, auto_delete=False)
+                    self.exchange_declared = True
+            finally:
+                # Manually remove logger to avoid shutdown message. Done in a
+                # finally so a failed connection attempt can't leak handlers.
+                rabbitmq_logger.removeHandler(handler)
 
     def close_connection(self):
         """
@@ -153,12 +183,18 @@ class RabbitMQHandlerOneWay(logging.Handler):
         while not self.stopped.is_set():
             time.sleep(1)
         if self.channel:
-            del self.channel
+            try:
+                self.channel.close()
+            except Exception:
+                pass
+            self.channel = None
 
         if self.connection:
-            del self.connection
-
-        self.connection, self.channel = None, None
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
 
     def start_message_worker(self):
         self.stopping = threading.Event()
@@ -228,13 +264,25 @@ class RabbitMQHandlerOneWay(logging.Handler):
 
             except Empty:
                 continue
-            except Exception:
+            except Exception as e:
                 self.channel, self.connection = None, None
                 if record is not None:
                     if not retry_record:
                         num_retries = 0
                     retry_record = True
                     num_retries += 1
+                    if num_retries == 1:
+                        logger.warning(
+                            "failed to send log record to RabbitMQ: %s", e
+                        )
+                    # Exponential backoff before retrying, with jitter.
+                    # Interruptible via `stopping` so shutdown is not delayed.
+                    backoff = min(
+                        self.max_retry_delay,
+                        self.retry_delay * (2 ** (num_retries - 1)),
+                    )
+                    backoff *= random.uniform(0.5, 1.5)
+                    self.stopping.wait(backoff)
             finally:
                 if self.stopping.is_set():
                     self.stopped.set()
@@ -272,9 +320,16 @@ class RabbitMQHandlerOneWay(logging.Handler):
             else:
                 formatted = self.format(record)
 
-            self.queue.put((formatted, routing_key))
-        except Exception:
+            try:
+                self.queue.put_nowait((formatted, routing_key))
+            except Full:
+                # Broker is down (or slow) and we're buffering too much in
+                # memory. Drop the newest record so we can't OOM the process.
+                self.record_dropped()
+        except Exception as e:
             self.channel, self.connection = None, None
+            logger.warning("failed to format log record for RabbitMQ: %s", e)
+            self.record_dropped()
             self.handleError(record)
 
     def queue_depth(self):

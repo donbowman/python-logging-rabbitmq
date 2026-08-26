@@ -27,7 +27,7 @@ TEST_REQUIRES = [
 ]
 
 setup(name='python-logging-rabbitmq',
-    version='2.0.0',
+    version='2.1.0',
 
     url='https://github.com/albertomr86/python-logging-rabbitmq',
     description='Send logs to RabbitMQ from Python/Django',
