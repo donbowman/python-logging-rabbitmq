@@ -18,7 +18,7 @@ try:
         from .compat import Empty
         from .compat import Full
         from .compat import Queue
-except:
+except Exception:
     from .compat import Empty
     from .compat import Full
     from .compat import Queue
@@ -161,6 +161,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
             handler = logging.StreamHandler()
             handler.setFormatter(self.formatter)
             rabbitmq_logger = logging.getLogger('pika')
+            orig_propagate = rabbitmq_logger.propagate
+            orig_level = rabbitmq_logger.level
             rabbitmq_logger.addHandler(handler)
             rabbitmq_logger.propagate = False
             rabbitmq_logger.setLevel(logging.WARNING)
@@ -180,6 +182,8 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 # Manually remove logger to avoid shutdown message. Done in a
                 # finally so a failed connection attempt can't leak handlers.
                 rabbitmq_logger.removeHandler(handler)
+                rabbitmq_logger.propagate = orig_propagate
+                rabbitmq_logger.setLevel(orig_level)
 
     def _close_target(self, target):
         try:
@@ -187,18 +191,7 @@ class RabbitMQHandlerOneWay(logging.Handler):
         except Exception:
             pass
 
-    def close_connection(self):
-        """
-        Close active connection.
-        """
-        self.stopping.set()
-        while not self.stopped.is_set():
-            time.sleep(1)
-
-        # Run the AMQP close handshake in a background thread so a broker that
-        # never responds (e.g. a network partition or a stub/test broker whose
-        # event loop isn't being pumped) cannot block shutdown forever. We wait
-        # up to CLOSE_HANDSHAKE_TIMEOUT for it to complete.
+    def _close_channel_and_connection(self):
         for attr in ("channel", "connection"):
             target = getattr(self, attr, None)
             setattr(self, attr, None)
@@ -210,12 +203,26 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 closer.start()
                 closer.join(CLOSE_HANDSHAKE_TIMEOUT)
 
+    def close_connection(self):
+        """
+        Close active connection.
+        """
+        self.stopping.set()
+        if threading.current_thread() != getattr(self, 'worker_thread', None):
+            self.stopped.wait(CLOSE_HANDSHAKE_TIMEOUT)
+
+        # Run the AMQP close handshake in a background thread so a broker that
+        # never responds (e.g. a network partition or a stub/test broker whose
+        # event loop isn't being pumped) cannot block shutdown forever. We wait
+        # up to CLOSE_HANDSHAKE_TIMEOUT for it to complete.
+        self._close_channel_and_connection()
+
     def start_message_worker(self):
         self.stopping = threading.Event()
         self.stopped = threading.Event()
-        worker = threading.Thread(target=self.message_worker)
-        worker.setDaemon(True)
-        worker.start()
+        self.worker_thread = threading.Thread(target=self.message_worker)
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
 
     def record_dropped(self):
         if self.dropped_record_callback:
@@ -231,8 +238,11 @@ class RabbitMQHandlerOneWay(logging.Handler):
 
     def message_worker(self):
         record = None
+        routing_key = None
         retry_record = False
         num_retries = 0
+        set_task_done = False
+
         while not self.stopping.is_set():
             try:
                 if retry_record and num_retries > self.max_send_retries:
@@ -241,22 +251,28 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     num_retries = 0
                     self.record_dropped()
                     try:
-                        if record:
+                        if record is not None:
                             self.handleError(record)
-                        record = None
-                    except:
+                    except Exception:
                         pass
+                    record = None
+                    routing_key = None
 
-                set_task_done=False
+                set_task_done = False
                 if not retry_record:
-                    set_task_done = True
-                    record, routing_key = self.queue.get(block=True, timeout=self.get_timeout_seconds)
+                    record = None
+                    routing_key = None
+                    try:
+                        record, routing_key = self.queue.get(block=True, timeout=self.get_timeout_seconds)
+                        set_task_done = True
+                    except Empty:
+                        continue
 
                 try:
                     if not self.connection or self.connection.is_closed or not self.channel or self.channel.is_closed:
                         self.open_connection()
 
-                    res = self.channel.basic_publish(
+                    self.channel.basic_publish(
                         exchange=self.exchange,
                         routing_key=routing_key,
                         body=record,
@@ -266,18 +282,22 @@ class RabbitMQHandlerOneWay(logging.Handler):
                         )
                     )
                     retry_record = False
+                    num_retries = 0
                     self.record_sent()
-                except:
+                    record = None
+                    routing_key = None
+                except Exception:
                     self.record_send_failed()
                     raise
                 finally:
                     # only if a record was retrieved from queue, set it to done.
                     if set_task_done:
                         set_task_done = False
-                        self.queue.task_done()
+                        try:
+                            self.queue.task_done()
+                        except Exception:
+                            pass
 
-            except Empty:
-                continue
             except Exception as e:
                 self.channel, self.connection = None, None
                 if record is not None:
@@ -299,10 +319,20 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     self.stopping.wait(backoff)
             finally:
                 if self.stopping.is_set():
-                    self.stopped.set()
                     break
                 if self.close_after_emit:
-                    self.close_connection()
+                    self._close_channel_and_connection()
+
+        if retry_record and record is not None:
+            self.record_dropped()
+            try:
+                self.handleError(record)
+            except Exception:
+                pass
+            record = None
+            routing_key = None
+            retry_record = False
+
         self.stopped.set()
 
     def emit(self, record):
@@ -341,7 +371,6 @@ class RabbitMQHandlerOneWay(logging.Handler):
                 # memory. Drop the newest record so we can't OOM the process.
                 self.record_dropped()
         except Exception as e:
-            self.channel, self.connection = None, None
             logger.warning("failed to format log record for RabbitMQ: %s", e)
             self.record_dropped()
             self.handleError(record)
@@ -360,11 +389,29 @@ class RabbitMQHandlerOneWay(logging.Handler):
         Free resources.
         """
         self.acquire()
-
-        if hasattr(self, 'queue'):
-            del self.queue
-
         try:
             self.close_connection()
+
+            if hasattr(self, 'queue'):
+                while True:
+                    try:
+                        item = self.queue.get_nowait()
+                    except (Empty, AttributeError):
+                        break
+                    try:
+                        self.record_dropped()
+                        if isinstance(item, tuple) and len(item) > 0:
+                            rec = item[0]
+                        else:
+                            rec = item
+                        self.handleError(rec)
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            self.queue.task_done()
+                        except Exception:
+                            pass
         finally:
             self.release()
+            super(RabbitMQHandlerOneWay, self).close()

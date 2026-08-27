@@ -22,6 +22,6 @@ except ImportError:
 try:
     from django.core.serializers.json import DjangoJSONEncoder as JSONEncoder  # noqa: F401
     from django.views.debug import ExceptionReporter as ExceptionReporter   # noqa: F401
-except:
+except Exception:
     from json.encoder import JSONEncoder as JSONEncoder  # noqa: F401
     ExceptionReporter = None
