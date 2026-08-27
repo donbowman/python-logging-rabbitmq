@@ -317,11 +317,12 @@ class RabbitMQHandlerOneWay(logging.Handler):
                     )
                     backoff *= random.uniform(0.5, 1.5)
                     self.stopping.wait(backoff)
-            finally:
-                if self.stopping.is_set():
-                    break
-                if self.close_after_emit:
-                    self._close_channel_and_connection()
+
+            if self.close_after_emit:
+                self._close_channel_and_connection()
+
+            if self.stopping.is_set():
+                break
 
         if retry_record and record is not None:
             self.record_dropped()
